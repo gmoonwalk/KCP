@@ -21,7 +21,7 @@
         /// </remarks>
         byte cmd { get; set; }
         /// <summary>
-        /// 剩余分片数量，表示随后还有多少个报文属于同一个包。
+        /// 剩余分片数量，表示随后还有多少个报文属于同一个包。当消息大于mss时，会分成多个fragment，最后一个为0.
         /// </summary>
         byte frg { get; set; }
         /// <summary>

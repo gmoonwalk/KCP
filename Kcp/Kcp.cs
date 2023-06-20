@@ -229,6 +229,7 @@ namespace System.Net.Sockets.Kcp
             #region merge fragment.
             /// merge fragment.
 
+            //把拆分的segment组合成完整的数据包，放到buffer中；rcv_queue删除这些处理过的包
             var recvLength = 0;
             lock (rcv_queueLock)
             {
@@ -259,7 +260,8 @@ namespace System.Net.Sockets.Kcp
             Move_Rcv_buf_2_Rcv_queue();
 
             #region fast recover
-            /// fast recover
+            /// fast recover，可用接收窗口 = rcv_wnd - rcv_queue.Count；这里表示可用接收窗口大于0，
+            /// 触发一个窗口通知报文，通知对方可以继续发了。
             if (rcv_queue.Count < rcv_wnd && recover)
             {
                 // ready to send back IKCP_CMD_WINS in ikcp_flush

@@ -165,7 +165,7 @@ namespace System.Net.Sockets.Kcp
         protected uint ts_recent;
         protected uint ts_lastack;
         /// <summary>
-        /// 拥塞窗口阈值
+        /// 拥塞窗口阈值 慢启动门限 ssthresh （slow start threshold）
         /// </summary>
         protected uint ssthresh;
         /// <summary>
@@ -215,7 +215,7 @@ namespace System.Net.Sockets.Kcp
         protected uint ts_flush;
         protected uint xmit;
         /// <summary>
-        /// 是否启动无延迟模式
+        /// 是否启动无延迟模式；0 关闭；1 累加，+上次rto * 1.5; 2 不累加，每次+ rto/2
         /// </summary>
         protected uint nodelay;
         /// <summary>
@@ -268,7 +268,7 @@ namespace System.Net.Sockets.Kcp
         protected readonly object rcv_queueLock = new object();
 
         /// <summary>
-        /// 发送 ack 队列 
+        /// 发送 ack 队列 ；接收到数据后，发送给对方的ack报文列表
         /// </summary>
         protected ConcurrentQueue<(uint sn, uint ts)> acklist = new ConcurrentQueue<(uint sn, uint ts)>();
         /// <summary>
@@ -285,7 +285,7 @@ namespace System.Net.Sockets.Kcp
         /// </summary>
         internal List<Segment> rcv_queue = new List<Segment>();
         /// <summary>
-        /// 正在等待重组消息列表
+        /// 正在等待重组消息列表；从小到大排列
         /// <para>需要执行的操作  添加 插入 遍历 删除</para>
         /// </summary>
         internal LinkedList<Segment> rcv_buf = new LinkedList<Segment>();
@@ -461,6 +461,12 @@ namespace System.Net.Sockets.Kcp
             return Min(Max(lower, middle), upper);
         }
 
+        /// <summary>
+        /// 返回两者的差，大于0表示前者大。
+        /// </summary>
+        /// <param name="later"></param>
+        /// <param name="earlier"></param>
+        /// <returns></returns>
         protected static int Itimediff(uint later, uint earlier)
         {
             return ((int)(later - earlier));
@@ -573,7 +579,8 @@ namespace System.Net.Sockets.Kcp
         }
 
         /// <summary>
-        /// move available data from rcv_buf -> rcv_queue
+        /// move available data from rcv_buf -> rcv_queue；
+        /// 滑动接收窗口；遍历rcv_buf，sn是下个要接收的编号，把segment移动到rcv_queue
         /// </summary>
         protected void Move_Rcv_buf_2_Rcv_queue()
         {
@@ -582,6 +589,7 @@ namespace System.Net.Sockets.Kcp
                 while (rcv_buf.Count > 0)
                 {
                     var seg = rcv_buf.First.Value;
+                    // sn是下个要接收的编号，把segment移动到rcv_queue
                     if (seg.sn == rcv_nxt && rcv_queue.Count < rcv_wnd)
                     {
                         rcv_buf.RemoveFirst();
@@ -634,6 +642,9 @@ namespace System.Net.Sockets.Kcp
             rx_rto = Ibound(rx_minrto, rto, IKCP_RTO_MAX);
         }
 
+        /// <summary>
+        /// 滑动窗口移动，snd_una是snd_buf中第一个的编号；或者snd_nxt
+        /// </summary>
         protected void Shrink_buf()
         {
             lock (snd_bufLock)
@@ -642,8 +653,14 @@ namespace System.Net.Sockets.Kcp
             }
         }
 
+        /// <summary>
+        /// 收到了sn报文，snd_buf中删掉sn这一条。
+        /// </summary>
+        /// <param name="sn"></param>
         protected void Parse_ack(uint sn)
         {
+            //1. 通过snd_una确认收到过的包，已经删了，无需再处理
+            //2. sn是还未发送过的编号，忽略
             if (Itimediff(sn, snd_una) < 0 || Itimediff(sn, snd_nxt) >= 0)
             {
                 return;
@@ -661,6 +678,7 @@ namespace System.Net.Sockets.Kcp
                         break;
                     }
 
+                    //列表是有序的，后面不用看了
                     if (Itimediff(sn, seg.sn) < 0)
                     {
                         break;
@@ -669,6 +687,10 @@ namespace System.Net.Sockets.Kcp
             }
         }
 
+        /// <summary>
+        /// 删除una之前的segment，una = rcv_nxt表示，对方una - 1已经收到，不用留着考虑重发了。
+        /// </summary>
+        /// <param name="una"></param>
         protected void Parse_una(uint una)
         {
             /// 删除给定时间之前的片段。保留之后的片段
@@ -691,6 +713,12 @@ namespace System.Net.Sockets.Kcp
 
         }
 
+        /// <summary>
+        /// 根据本次接收的最大ack和ts，计算是否快速重传；将发送缓冲区snd_buf中所有小于该ack sn的包，fastack++。
+        /// fastack超过上限就快速重传
+        /// </summary>
+        /// <param name="sn"></param>
+        /// <param name="ts"></param>
         protected void Parse_fastack(uint sn, uint ts)
         {
             if (Itimediff(sn, snd_una) < 0 || Itimediff(sn, snd_nxt) >= 0)
@@ -723,7 +751,7 @@ namespace System.Net.Sockets.Kcp
         }
 
         /// <summary>
-        /// 处理下层网络收到的数据包
+        /// 处理下层网络收到的数据包；包存放到rcv_buf接收缓冲；再根据滑动窗口放入rcv_queue
         /// </summary>
         /// <param name="newseg"></param>
         internal virtual void Parse_data(Segment newseg)
@@ -741,7 +769,7 @@ namespace System.Net.Sockets.Kcp
 
                 var repeat = false;
 
-                ///检查是否重复消息和插入位置
+                ///检查是否重复消息和插入位置，rcv_buf链表是从小到大排列，根据sn找出p是小于sn的那个节点；newseg加入到它后面即可
                 LinkedListNode<Segment> p;
                 for (p = rcv_buf.Last; p != null; p = p.Previous)
                 {
@@ -856,6 +884,7 @@ namespace System.Net.Sockets.Kcp
                     return;
                 }
 
+                // 告知发送方ack报文，通知已经接收的包
                 while (acklist.TryDequeue(out var temp))
                 {
                     if (offset + IKCP_OVERHEAD > mtu)
@@ -880,6 +909,7 @@ namespace System.Net.Sockets.Kcp
 
                 #region probe window size (if remote window size equals zero)
                 // probe window size (if remote window size equals zero)
+                //如果远端窗口大小为0，进行窗口探测报文倒计时
                 if (rmt_wnd == 0)
                 {
                     if (probe_wait == 0)
@@ -917,6 +947,7 @@ namespace System.Net.Sockets.Kcp
 
                 #region flush window probing commands
                 // flush window probing commands
+                // 发送窗口探测报文
                 if ((probe & IKCP_ASK_SEND) != 0)
                 {
                     seg.cmd = IKCP_CMD_WASK;
@@ -929,6 +960,7 @@ namespace System.Net.Sockets.Kcp
                     offset += seg.Encode(buffer.Memory.Span.Slice(offset));
                 }
 
+                // 发送窗口大小给对方
                 if ((probe & IKCP_ASK_TELL) != 0)
                 {
                     seg.cmd = IKCP_CMD_WINS;
@@ -948,6 +980,7 @@ namespace System.Net.Sockets.Kcp
             #region 刷新，将发送等待列表移动到发送列表
 
             // calculate window size
+            // 选择发送窗口、对方接受窗口、拥塞控制窗口中最小的
             var cwnd_ = Min(snd_wnd, rmt_wnd);
             if (nocwnd == 0)
             {
@@ -958,20 +991,20 @@ namespace System.Net.Sockets.Kcp
             {
                 if (snd_queue.TryDequeue(out var newseg))
                 {
-                    newseg.conv = conv;
-                    newseg.cmd = IKCP_CMD_PUSH;
-                    newseg.wnd = wnd_;
-                    newseg.ts = current_;
-                    newseg.sn = snd_nxt;
-                    snd_nxt++;
-                    newseg.una = rcv_nxt;
-                    newseg.resendts = current_;
-                    newseg.rto = rx_rto;
-                    newseg.fastack = 0;
-                    newseg.xmit = 0;
+                    newseg.conv = conv;//频道号
+                    newseg.cmd = IKCP_CMD_PUSH;//报文类型：数据报文
+                    newseg.wnd = wnd_;//窗口大小
+                    newseg.ts = current_;//发送时间戳
+                    newseg.sn = snd_nxt;//发送编号
+                    snd_nxt++;//自增
+                    newseg.una = rcv_nxt;//?
+                    newseg.resendts = current_;//重传的时间戳。超过当前时间重发这个包，发送时会继续修改，加rto
+                    newseg.rto = rx_rto;//超时重传时间
+                    newseg.fastack = 0;//快速重传技术，每次发送都置零
+                    newseg.xmit = 0;//重传次数
                     lock (snd_bufLock)
                     {
-                        snd_buf.AddLast(newseg);
+                        snd_buf.AddLast(newseg);//加入到正在发送列表
                     }
                 }
                 else
@@ -996,7 +1029,7 @@ namespace System.Net.Sockets.Kcp
                     var segment = item;
                     var needsend = false;
                     var debug = Itimediff(current_, segment.resendts);
-                    if (segment.xmit == 0)
+                    if (segment.xmit == 0) //首次发送
                     {
                         //新加入 snd_buf 中, 从未发送过的报文直接发送出去;
                         needsend = true;
@@ -1004,7 +1037,7 @@ namespace System.Net.Sockets.Kcp
                         segment.rto = rx_rto;
                         segment.resendts = current_ + rx_rto + rtomin;
                     }
-                    else if (Itimediff(current_, segment.resendts) >= 0)
+                    else if (Itimediff(current_, segment.resendts) >= 0)//超时重发
                     {
                         //发送过的, 但是在 RTO 内未收到 ACK 的报文, 需要重传;
                         needsend = true;
@@ -1012,18 +1045,19 @@ namespace System.Net.Sockets.Kcp
                         this.xmit++;
                         if (nodelay == 0)
                         {
+                            //累加rto翻倍
                             segment.rto += Math.Max(segment.rto, rx_rto);
                         }
                         else
                         {
                             var step = nodelay < 2 ? segment.rto : rx_rto;
-                            segment.rto += step / 2;
+                            segment.rto += step / 2;// rto * 1.5
                         }
 
                         segment.resendts = current_ + segment.rto;
                         lost = 1;
                     }
-                    else if (segment.fastack >= resent)
+                    else if (segment.fastack >= resent)//快速重传
                     {
                         //发送过的, 但是 ACK 失序若干次的报文, 需要执行快速重传.
                         if (segment.xmit <= fastlimit
@@ -1043,14 +1077,18 @@ namespace System.Net.Sockets.Kcp
                         segment.wnd = wnd_;
                         segment.una = rcv_nxt;
 
+                        //包头和消息体长度
                         var need = IKCP_OVERHEAD + segment.len;
                         if (offset + need > mtu)
                         {
+                            //超过mtu，buffer可能已经填充了offset部分。这部分先发出去。
+                            //这里不怕offset超过mtu吗？
                             callbackHandle.Output(buffer, offset);
                             offset = 0;
                             buffer = CreateBuffer(BufferNeedSize);
                         }
 
+                        //segment编码到buffer中
                         offset += segment.Encode(buffer.Memory.Span.Slice(offset));
 
                         if (CanLog(KcpLogMask.IKCP_LOG_NEED_SEND))
@@ -1058,6 +1096,7 @@ namespace System.Net.Sockets.Kcp
                             LogWriteLine($"{segment.ToLogString(true)}", KcpLogMask.IKCP_LOG_NEED_SEND.ToString());
                         }
 
+                        //超过最大重传次数，是不是可以停止通信了？
                         if (segment.xmit >= dead_link)
                         {
                             state = -1;
@@ -1074,6 +1113,7 @@ namespace System.Net.Sockets.Kcp
             // flash remain segments
             if (offset > 0)
             {
+                //调用OutPut进行消息发送
                 callbackHandle.Output(buffer, offset);
                 offset = 0;
                 buffer = CreateBuffer(BufferNeedSize);
@@ -1096,6 +1136,7 @@ namespace System.Net.Sockets.Kcp
                 incr = cwnd * mss;
             }
 
+            // 发生了重传，进行拥塞控制
             if (lost != 0)
             {
                 ssthresh = cwnd / 2;
@@ -1420,6 +1461,7 @@ namespace System.Net.Sockets.Kcp
         /// <summary>
         /// update state (call it repeatedly, every 10ms-100ms), or you can ask
         /// ikcp_check when to call it again (without ikcp_input/_send calling).
+        /// 定时interval间隔调用Flush函数
         /// </summary>
         /// <param name="time">DateTime.UtcNow</param>
         public void Update(in DateTimeOffset time)
@@ -1734,12 +1776,13 @@ namespace System.Net.Sockets.Kcp
                 LogWriteLine($"[RI] {span.Length} bytes", KcpLogMask.IKCP_LOG_INPUT.ToString());
             }
 
+            //长度不合符，说明不是kcp包头
             if (span.Length < IKCP_OVERHEAD)
             {
                 return -1;
             }
 
-            uint prev_una = snd_una;
+            uint prev_una = snd_una;//第一个未确认的编号
             var offset = 0;
             int flag = 0;
             uint maxack = 0;
@@ -1760,6 +1803,7 @@ namespace System.Net.Sockets.Kcp
                     break;
                 }
 
+                //解析包头
                 Span<byte> header = stackalloc byte[24];
                 span.Slice(offset, 24).CopyTo(header);
                 offset += ReadHeader(header,
@@ -1772,6 +1816,7 @@ namespace System.Net.Sockets.Kcp
                                      ref una,
                                      ref length);
 
+                //频道号不一致，连接失效
                 if (conv != conv_)
                 {
                     return -1;
@@ -1793,18 +1838,19 @@ namespace System.Net.Sockets.Kcp
                         return -3;
                 }
 
-                rmt_wnd = wnd;
-                Parse_una(una);
-                Shrink_buf();
-
-                if (IKCP_CMD_ACK == cmd)
+                rmt_wnd = wnd;//对方的接收窗口，查看Wnd_unused()
+                Parse_una(una);//删除una之前的segment，una = rcv_nxt表示，对方una - 1已经收到，不用留着考虑重发了。
+                Shrink_buf();//更新滑动窗口
+                
+                if (IKCP_CMD_ACK == cmd)//收到ACK确认报文
                 {
                     if (Itimediff(current, ts) >= 0)
                     {
+                        //采样rtt计算rto
                         Update_ack(Itimediff(current, ts));
                     }
-                    Parse_ack(sn);
-                    Shrink_buf();
+                    Parse_ack(sn);//在snd_buf中删除sn这一条
+                    Shrink_buf();//更新滑动窗口
 
                     if (flag == 0)
                     {
@@ -1818,6 +1864,8 @@ namespace System.Net.Sockets.Kcp
                         maxack = sn;
                         latest_ts = ts;
 #else
+//FASTACK_CONSERVE模式，增加发送时间判断。如果ts比上一次ts大才更新maxack(正常情况下都是这样，除非有重发)。
+//ts比上一次ts小是发送的更早，而这个包sn大。说明上一个包是重发的，这种情况不更新maxack
                         if (Itimediff(ts, latest_ts) > 0)
                         {
                             maxack = sn;
@@ -1831,13 +1879,14 @@ namespace System.Net.Sockets.Kcp
                         LogWriteLine($"input ack: sn={sn} rtt={Itimediff(current, ts)} rto={rx_rto}", KcpLogMask.IKCP_LOG_IN_ACK.ToString());
                     }
                 }
-                else if (IKCP_CMD_PUSH == cmd)
+                else if (IKCP_CMD_PUSH == cmd)//收到数据报文
                 {
                     if (CanLog(KcpLogMask.IKCP_LOG_IN_DATA))
                     {
                         LogWriteLine($"input psh: sn={sn} ts={ts}", KcpLogMask.IKCP_LOG_IN_DATA.ToString());
                     }
 
+                    //未超出接收窗口
                     if (Itimediff(sn, rcv_nxt + rcv_wnd) < 0)
                     {
                         ///instead of ikcp_ack_push
@@ -1868,6 +1917,7 @@ namespace System.Net.Sockets.Kcp
                 {
                     // ready to send back IKCP_CMD_WINS in Ikcp_flush
                     // tell remote my window size
+                    // 收到窗口查询，下一次flush发送窗口通知报文
                     probe |= IKCP_ASK_TELL;
 
                     if (CanLog(KcpLogMask.IKCP_LOG_IN_PROBE))
